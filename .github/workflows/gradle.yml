@@ -1,4 +1,15 @@
-name: Gradle CI
+# Build and Release workflow for Voxy Seam Fix.
+#
+# How it works:
+#   1. Every push to "master", every pull request targeting "master", and every
+#      manual run (workflow_dispatch) compiles the mod with Gradle.
+#   2. On top of that, every update that lands on "master" (push or manual run)
+#      also publishes the compiled .jar as a GitHub Release, so there is always
+#      a ready-to-download build in the "Releases" section of the repository.
+#   3. Pull requests only build the .jar (as a temporary workflow artifact) and
+#      never publish a Release, so unreviewed code cannot ship by accident.
+
+name: Build and Release
 
 on:
   push:
@@ -9,16 +20,27 @@ on:
       - master
   workflow_dispatch:
 
+# Least privilege by default: jobs only get the permissions they declare.
+# The "build" job is fine with read-only access; only the "release" job
+# below asks for write access, because creating a Release requires it.
 permissions:
   contents: read
 
 concurrency:
   group: gradle-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Do not cancel a run that is already publishing a Release, otherwise a
+  # quick follow-up push could leave a half-uploaded Release behind.
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Build .jar
     runs-on: ubuntu-24.04
+
+    # Expose the mod version and the Release tag to the "release" job.
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
 
     steps:
       - name: Check out repository
@@ -33,13 +55,104 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6.4.0
 
+      # Read the mod version from gradle.properties (e.g. mod_version=0.1.0)
+      # and derive the Release tag from it. The short commit hash is appended
+      # (e.g. "v0.1.0-c3d2abb") so that every update gets its own unique
+      # Release instead of overwriting the previous one. Tip: bump
+      # "mod_version" in gradle.properties whenever you cut a new version.
+      - name: Read mod version
+        id: version
+        run: |
+          version="$(grep -E '^mod_version=' gradle.properties | cut -d '=' -f 2- | tr -d '[:space:]')"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read mod_version from gradle.properties"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "Mod version: $version"
+
       - name: Build mod
         run: ./gradlew --no-daemon build
 
+      # The build folder can also contain auxiliary jars (e.g. a "-sources"
+      # jar produced by Fabric Loom). Pick only the main mod jar, which is
+      # the one players install, and fail loudly if it is missing.
+      - name: Select the jar to publish
+        id: jar
+        run: |
+          jar="$(find build/libs -maxdepth 1 -type f -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*-dev.jar' | sort | head -n 1)"
+          if [ -z "$jar" ]; then
+            echo "::error::No .jar found in build/libs after the build"
+            exit 1
+          fi
+          echo "path=$jar" >> "$GITHUB_OUTPUT"
+          echo "Built jar: $jar"
+
+      # Upload the jar as a workflow artifact: this keeps it downloadable
+      # from the run page (handy for pull requests) and hands it over to
+      # the "release" job below.
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: voxy-seam-fix-${{ github.sha }}
-          path: build/libs/*.jar
+          path: ${{ steps.jar.outputs.path }}
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    # Releases are only published for code that is already on "master":
+    # direct pushes to "master", or a manual run started from "master".
+    # Pull requests use a "refs/pull/..." ref, so they never match this.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-24.04
+
+    # Creating a Release (and its tag) is the only step in this workflow
+    # that needs write access to the repository.
+    permissions:
+      contents: write
+
+    steps:
+      # Fetch the exact jar that the "build" job produced, so the Release
+      # ships the very same file that was compiled and verified above.
+      - name: Download the built jar
+        uses: actions/download-artifact@v7
+        with:
+          name: voxy-seam-fix-${{ github.sha }}
+          path: artifact
+
+      # Publish the jar with the GitHub CLI, which is preinstalled on the
+      # runner. "GH_REPO" is set explicitly because this job does not check
+      # out the repository, so the CLI cannot infer it from a local clone.
+      # If the Release already exists (e.g. the workflow was re-run for the
+      # same commit), the jar is simply replaced instead of failing.
+      - name: Publish jar to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          MOD_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          jar="$(find artifact -maxdepth 1 -type f -name '*.jar' | sort | head -n 1)"
+          if [ -z "$jar" ]; then
+            echo "::error::No .jar found in the downloaded artifact"
+            exit 1
+          fi
+
+          echo "Publishing $jar as release $RELEASE_TAG"
+          release_title="Voxy Seam Fix v${MOD_VERSION} (${GITHUB_SHA::7})"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # Re-run for a commit that was already released: replace the jar.
+            gh release upload "$RELEASE_TAG" "$jar" --clobber
+          else
+            # First run for this commit: create the tag and the Release,
+            # letting GitHub generate the release notes automatically.
+            gh release create "$RELEASE_TAG" "$jar" \
+              --title "$release_title" \
+              --target "$GITHUB_SHA" \
+              --generate-notes
+          fi
