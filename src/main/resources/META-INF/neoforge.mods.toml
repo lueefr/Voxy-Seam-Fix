@@ -1,0 +1,43 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+
+[[mods]]
+modId = "voxy_seam_fix"
+version = "${version}"
+displayName = "Voxy Seam Fix"
+authors = "HTRMC"
+logoFile = "assets/voxy-seam-fix/icon.png"
+description = '''
+Pins voxy's LOD fluid surfaces to one real plane so the sea stops stepping up by a voxel at
+every LOD ring. Works with any voxy build whose shaders still use the quad setup this mod
+knows how to patch; everything it hooks fails soft instead of crashing.
+'''
+
+[[mixins]]
+config = "voxyseamfix.mixins.json"
+
+[[dependencies.voxy_seam_fix]]
+modId = "neoforge"
+type = "required"
+versionRange = "${neoforge_version_range}"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.voxy_seam_fix]]
+modId = "minecraft"
+type = "required"
+versionRange = "${minecraft_version_range}"
+ordering = "NONE"
+side = "CLIENT"
+
+# Deliberately optional and open-ended: voxy itself is never distributed, and every port of it
+# (the 1.21.1 NeoForge ports, and the Fabric jar that Roxy loads on NeoForge) reports wildly
+# different versions under the same "voxy" id. The mixins decide at load time whether this build
+# can hook the renderer, so a hard version pin would only stop the mod from loading for no reason.
+[[dependencies.voxy_seam_fix]]
+modId = "voxy"
+type = "optional"
+versionRange = "[0.1.0,)"
+ordering = "AFTER"
+side = "CLIENT"
