@@ -50,8 +50,10 @@ Everything the mod hooks **fails soft**:
 * The `voxy` dependency in `neoforge.mods.toml` is optional and open-ended, because ports report
   wildly different versions under the same mod id.
 
-Two `processTextureBakeResult` shapes are covered out of the box (5 and 6 parameters, the latter with
-the render layer coerced to `Object` because its type moved between Minecraft versions).
+Two `processTextureBakeResult` shapes are covered out of the box: 5 parameters, and 6 with the
+`RenderType` layer that 1.21.1 builds have. (Mixin's `@Coerce` only works for primitive widening, so
+an object argument cannot be coerced into a type-agnostic handler — a build whose layer type changed
+simply does not match, and is skipped instead of crashing.)
 
 If the log says the fluid hook did not apply and the sea still steps, set
 `"pinTranslucentModels": true` in `config/voxy-seam-fix.json`: water is always a translucent model,
@@ -87,7 +89,8 @@ so the pin then falls back to translucent top faces.
 ## Building
 
 ```bash
-./gradlew build
+./gradlew build      # jar in build/libs
+./gradlew test       # shader patcher unit tests, no game required
 ```
 
 The jar lands in `build/libs/`. It compiles against ModDevGradle on the NeoForge 21.1 / Java 21

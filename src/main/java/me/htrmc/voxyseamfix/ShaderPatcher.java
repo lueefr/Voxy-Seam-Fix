@@ -3,8 +3,6 @@ package me.htrmc.voxyseamfix;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -35,9 +33,33 @@ import java.util.regex.Pattern;
  * so writing at a hard-coded offset would corrupt somebody else's uniform. The shader already has
  * {@code baseSectionPos}, and {@code quad.basePoint} is built relative to it, so
  * {@code seaLevel - baseSectionPos.y*32} gives the same plane without touching the UBO at all.
+ *
+ * <p>Deliberately free of Minecraft and voxy types so it can be unit tested on its own.
  */
 public final class ShaderPatcher {
     private ShaderPatcher() {}
+
+    /** What {@link #patch} did with a source file. */
+    public enum Status {
+        /** No {@code setupQuad} in this source: nothing to do (most shaders). */
+        NOT_A_QUAD_SHADER,
+        /** Already carries this patch, e.g. a cached/duplicated compile unit. */
+        ALREADY_PATCHED,
+        /** This is a quad shader, but this voxy build reformatted it past recognition. */
+        ANCHORS_MISSING,
+        /** Patched. */
+        PATCHED
+    }
+
+    /**
+     * @param source the resulting GLSL (identical to the input unless {@link Status#PATCHED})
+     * @param status what happened
+     */
+    public record Result(String source, Status status) {
+        public boolean changed() {
+            return this.status == Status.PATCHED;
+        }
+    }
 
     /** {@code vec3 quadStart = extractPos(rawQuad);} */
     private static final Pattern POS_LINE =
@@ -52,23 +74,25 @@ public final class ShaderPatcher {
             Pattern.compile("^\\s*quad\\.basePoint\\s*=\\s*\\(\\s*quadStart\\s*\\*\\s*lodScale\\s*\\)\\s*\\+\\s*vec3\\(\\s*baseSection\\s*<<\\s*5\\s*\\)\\s*;\\s*$");
 
     /** Marker so a source that already went through here is never patched twice. */
-    private static final String ALREADY_PATCHED = "voxyseamfix_rawPos";
-
-    private static final Set<String> WARNED = ConcurrentHashMap.newKeySet();
+    static final String ALREADY_PATCHED_MARKER = "voxyseamfix_rawPos";
 
     /**
-     * @param id     shader asset id, only used for logging
-     * @param source fully merged GLSL source (voxy's {@code ShaderLoader.parse} output)
-     * @return the patched source, or the original when this shader does not contain the anchors
+     * @param source              fully merged GLSL source (voxy's {@code ShaderLoader.parse} output)
+     * @param surfaceLevel        world Y the fluid surface is pinned to
+     * @param pinTranslucentModels also pin translucent models, for voxy builds whose fluid models
+     *                             cannot be flagged
      */
-    public static String patch(String id, String source) {
-        if (source == null || source.isEmpty() || !VoxySeamFix.config().enabled) {
-            return source;
+    public static Result patch(String source, int surfaceLevel, boolean pinTranslucentModels) {
+        if (source == null || source.isEmpty()) {
+            return new Result(source, Status.NOT_A_QUAD_SHADER);
         }
-        // Only the program that actually builds quads is interesting; the compute/fragment programs
-        // share helper files but have nothing to pin.
-        if (!source.contains("void setupQuad(") || source.contains(ALREADY_PATCHED)) {
-            return source;
+        // Only the program that actually builds quads is interesting; the compute and fragment
+        // programs share helper files but have nothing to pin.
+        if (!source.contains("void setupQuad(")) {
+            return new Result(source, Status.NOT_A_QUAD_SHADER);
+        }
+        if (source.contains(ALREADY_PATCHED_MARKER)) {
+            return new Result(source, Status.ALREADY_PATCHED);
         }
 
         String[] lines = source.split("\n", -1);
@@ -85,12 +109,10 @@ public final class ShaderPatcher {
             }
         }
 
-        if (posIndex < 0 || indentationIndex < 0 || basePointIndex < 0) {
-            warnOnce("anchors:" + id, "voxy's setupQuad no longer matches the anchors this build knows"
-                    + " (missing: " + (posIndex < 0 ? "quadStart " : "") + (indentationIndex < 0 ? "depthOffset " : "")
-                    + (basePointIndex < 0 ? "basePoint" : "") + "), so fluid surfaces are NOT being pinned in "
-                    + id + ". This build of voxy-seam-fix is out of date for this voxy version.");
-            return source;
+        // Out of order would mean the patched code reads a variable before it exists, so treat it
+        // the same as a missing anchor.
+        if (posIndex < 0 || indentationIndex <= posIndex || basePointIndex <= indentationIndex) {
+            return new Result(source, Status.ANCHORS_MISSING);
         }
 
         String indent = leadingWhitespace(lines[basePointIndex]);
@@ -99,52 +121,49 @@ public final class ShaderPatcher {
         List<String> out = new ArrayList<>(lines.length + 16);
         for (int i = 0; i < lines.length; i++) {
             if (i == posIndex) {
-                out.add(indent + "vec3 voxyseamfix_rawPos = extractPos(rawQuad);");
-                out.add(indent + "vec3 quadStart = voxyseamfix_rawPos;");
+                out.add(indent + "vec3 " + ALREADY_PATCHED_MARKER + " = extractPos(rawQuad);");
+                out.add(indent + "vec3 quadStart = " + ALREADY_PATCHED_MARKER + ";");
             } else if (i == indentationIndex) {
                 // The indentation is a distance in blocks (a fluid's top face is 14/16), but the
                 // quad is scaled by lodScale below. Divide it out first, otherwise the surface sits
-                // 2/16*lodScale low with a different error on every LOD level.
+                // 2/16*lodScale low, by a different amount on every LOD level.
                 out.add(indentationIndent + "float voxyseamfix_indentation = extractFaceIndentation(faceData);");
                 out.add(indentationIndent + "float depthOffset = voxyseamfix_indentation/lodScale;");
             } else {
                 out.add(lines[i]);
                 if (i == basePointIndex) {
-                    out.addAll(pinBlock(indent));
+                    out.addAll(pinBlock(indent, surfaceLevel, pinTranslucentModels));
                 }
             }
         }
 
-        VoxySeamFix.LOGGER.info("voxy-seam-fix: pinned fluid surfaces to y={} in {}",
-                VoxySeamFix.fluidSurfaceLevel(), id);
-        return String.join("\n", out);
+        return new Result(String.join("\n", out), Status.PATCHED);
     }
 
     /**
      * The pin itself. It runs after {@code quad.basePoint} has been computed, in the same
      * baseSectionPos-relative space, and only for the top face ({@code face == 1u}) of a model that
-     * carries the fluid flag written by {@link FluidModelMarker}.
+     * carries the fluid flag written by {@code FluidModelMarker}.
      */
-    private static List<String> pinBlock(String indent) {
-        double surfaceLevel = VoxySeamFix.fluidSurfaceLevel();
+    private static List<String> pinBlock(String indent, int surfaceLevel, boolean pinTranslucentModels) {
         // Locale.ROOT: a comma decimal separator would produce a GLSL syntax error.
-        String surface = String.format(Locale.ROOT, "%.2f", surfaceLevel);
+        String surface = String.format(Locale.ROOT, "%.2f", (double) surfaceLevel);
 
-        String condition = "((model.flagsA & " + VoxySeamFix.FLUID_MODEL_FLAG + "u) != 0)";
-        if (VoxySeamFix.config().pinTranslucentModels) {
+        String condition = "((model.flagsA & 16u) != 0)";
+        if (pinTranslucentModels) {
             // Fallback for voxy builds we cannot flag: water is always a translucent model, so
             // pinning translucent top faces gets the sea back even without the fluid flag.
             condition = "(" + condition + " || ((model.flagsA & 4u) != 0))";
         }
 
-        List<String> block = new ArrayList<>(13);
+        List<String> block = new ArrayList<>(11);
         block.add(indent + "// voxy-seam-fix: mipping never lets air win, so a fluid surface rounds up to the top");
         block.add(indent + "// of whichever LOD voxel straddles it and the sea ends up a whole voxel higher on every");
         block.add(indent + "// coarser level. Pin those top faces to the one real plane. Everything here is relative to");
         block.add(indent + "// baseSectionPos, which is the space quad.basePoint is built in.");
         block.add(indent + "if (face == 1u && " + condition + ") {");
         block.add(indent + "    float voxyseamfix_surfaceY = " + surface + " - float(baseSectionPos.y)*32.0;");
-        block.add(indent + "    float voxyseamfix_voxelTop = (voxyseamfix_rawPos.y + 1.0)*lodScale + float(baseSection.y)*32.0;");
+        block.add(indent + "    float voxyseamfix_voxelTop = (" + ALREADY_PATCHED_MARKER + ".y + 1.0)*lodScale + float(baseSection.y)*32.0;");
         block.add(indent + "    if (voxyseamfix_voxelTop >= voxyseamfix_surfaceY && voxyseamfix_voxelTop - lodScale < voxyseamfix_surfaceY) {");
         block.add(indent + "        quad.basePoint.y = voxyseamfix_surfaceY - voxyseamfix_indentation;");
         block.add(indent + "    }");
@@ -158,11 +177,5 @@ public final class ShaderPatcher {
             end++;
         }
         return line.substring(0, end);
-    }
-
-    private static void warnOnce(String key, String message) {
-        if (WARNED.add(key)) {
-            VoxySeamFix.LOGGER.warn("voxy-seam-fix: {}", message);
-        }
     }
 }

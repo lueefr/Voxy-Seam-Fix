@@ -81,6 +81,9 @@ jobs:
             echo "== compile warnings =="
             grep -E 'warning: |warning \[|deprecat' build.log 2>/dev/null | sort -u | head -n 40 || true
             echo
+            echo "== tests =="
+            grep -E 'Test > |PASSED|FAILED' build.log 2>/dev/null | tail -n 40 || true
+            echo
             echo "== expanded neoforge.mods.toml =="
             cat build/resources/main/META-INF/neoforge.mods.toml 2>/dev/null || echo "(missing)"
             echo

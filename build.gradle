@@ -45,6 +45,19 @@ neoForge {
 
 dependencies {
     compileOnly sourceSets.voxyStubs.output
+
+    // The shader patcher is plain string handling on purpose, so it can be tested without a game,
+    // a GPU, or voxy itself.
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
 }
 
 tasks.named('compileJava', JavaCompile) {
