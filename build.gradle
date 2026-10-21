@@ -1,5 +1,13 @@
+// Voxy Seam Fix -- NeoForge 1.21.1 port.
+//
+// Built with ModDevGradle on the exact toolchain the NeoForge 1.21.1 voxy ports use
+// (see falling-colud/voxy-forged): NeoForge 21.1.x, Java 21, official Mojang mappings.
+// No mixin annotation processor / refmap is needed because NeoForge ships Minecraft with
+// official names at runtime, so every class and method selector used by the mixins below is
+// already spelled the way it exists at runtime.
+
 plugins {
-    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'net.neoforged.moddev' version "${moddev_version}"
 }
 
 version = project.mod_version
@@ -9,54 +17,90 @@ base {
     archivesName = project.archives_base_name
 }
 
-repositories {
-    exclusiveContent {
-        forRepository {
-            maven {
-                name = "Modrinth"
-                url = "https://api.modrinth.com/maven"
-            }
+// ---------------------------------------------------------------------------
+// Voxy is "all rights reserved" and is not published to any maven, so this project never links
+// against it directly. Instead it compiles against a handful of compile-only stubs (src/voxyStubs)
+// that mirror exactly the members this mod references. The stubs are never packaged -- see the
+// `jar` block below -- and at runtime everything comes from whichever voxy jar the player uses.
+// ---------------------------------------------------------------------------
+sourceSets {
+    voxyStubs
+}
+
+neoForge {
+    version = project.neoforge_version
+
+    runs {
+        client {
+            client()
         }
-        filter {
-            includeGroup "maven.modrinth"
+    }
+
+    mods {
+        voxySeamFix {
+            sourceSet sourceSets.main
         }
     }
 }
 
 dependencies {
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    compileOnly sourceSets.voxyStubs.output
 
-    // Loom 1.16 remaps mod dependencies on the plain configurations, same as voxy's own build does.
-    implementation "maven.modrinth:voxy:${project.voxy_version}"
-
-    // Only needed so runClient can actually boot voxy.
-    runtimeOnly "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-    runtimeOnly "maven.modrinth:sodium:${project.sodium_version}"
+    // The shader patcher is plain string handling on purpose, so it can be tested without a game,
+    // a GPU, or voxy itself.
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
-loom {
-    runConfigs.client {
-        vmArgs "-Xmx8G"
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
     }
+}
+
+tasks.named('compileJava', JavaCompile) {
+    dependsOn tasks.named('voxyStubsClasses')
 }
 
 processResources {
-    inputs.property "version", project.version
-    filesMatching("fabric.mod.json") {
-        expand "version": project.version
+    def props = [
+            'version'                : project.mod_version,
+            'minecraft_version_range': project.minecraft_version_range,
+            'neoforge_version_range' : project.neoforge_version_range
+    ]
+    inputs.properties(props)
+
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand(props)
     }
 }
 
-def targetJavaVersion = 25
-tasks.withType(JavaCompile).configureEach {
-    it.options.encoding = "UTF-8"
-    it.options.release = targetJavaVersion
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(project.java_version as int)
+    }
 }
 
-java {
-    def javaVersion = JavaVersion.toVersion(targetJavaVersion)
-    if (JavaVersion.current() < javaVersion) {
-        toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = 'UTF-8'
+    it.options.release = project.java_version as int
+}
+
+jar {
+    // Belt and braces: the compile-only voxy stubs must never ship, otherwise they would shadow
+    // the real voxy classes and break every mixin.
+    exclude 'me/cortex/**'
+
+    manifest {
+        attributes([
+                'Specification-Title'   : 'voxy-seam-fix',
+                'Specification-Vendor'  : 'HTRMC',
+                'Specification-Version' : '1',
+                'Implementation-Title'  : project.name,
+                'Implementation-Version': project.version,
+                'Implementation-Vendor' : 'HTRMC'
+        ])
     }
 }
