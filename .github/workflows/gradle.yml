@@ -64,8 +64,35 @@ jobs:
           java -version
           ./gradlew --version
 
+      # The log is kept around for the diagnostics step below (and for the artifact on failure).
       - name: Build mod
-        run: ./gradlew --no-daemon --stacktrace build
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace build 2>&1 | tee build.log
+
+      # Everything the outside world needs to see about a build that cannot be downloaded (step logs
+      # live behind authenticated blob storage) is published as a single check-run annotation.
+      - name: Publish build diagnostics
+        if: always()
+        run: |
+          esc() { sed -e 's/%/%25/g' -e 's/\r//g' | awk '{ printf "%s%%0A", $0 }'; }
+
+          {
+            echo "== compile warnings =="
+            grep -E 'warning: |warning \[|deprecat' build.log 2>/dev/null | sort -u | head -n 40 || true
+            echo
+            echo "== expanded neoforge.mods.toml =="
+            cat build/resources/main/META-INF/neoforge.mods.toml 2>/dev/null || echo "(missing)"
+            echo
+            for jar in build/libs/*.jar; do
+              [ -e "$jar" ] || continue
+              echo "== $jar =="
+              unzip -l "$jar"
+            done
+          } > diagnostics.txt 2>&1 || true
+
+          printf '::notice title=BuildDiagnostics::%s\n' "$(esc < diagnostics.txt | head -c 60000)"
+
 
       # The jar must contain the NeoForge metadata and the mixin config, and must NOT contain any of
       # the compile-only voxy stubs (they would shadow the real voxy classes and break every mixin).
